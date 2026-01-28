@@ -4,12 +4,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
 # Import your routers
-from routers import pdf_chat 
+from .routers import pdf_chat 
 # from .routers import todo_app  <-- In the future, you add this!
 
 load_dotenv()
 
 app = FastAPI()
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,6 +26,7 @@ app.add_middleware(
 # Endpoints become: /api/pdf/upload, /api/pdf/chat, etc.
 app.include_router(pdf_chat.router, prefix="/api/pdf", tags=["PDF Chat"])
 
+#f1
 # Project 2: Todo App (Future)
 # app.include_router(todo_app.router, prefix="/api/todo", tags=["Todo App"])
 
