@@ -187,3 +187,45 @@ async def cleanup(session_id: str = Form(...)):
         return {"status": "cleaned"}
     except Exception as e:
         return {"status": "error", "detail": str(e)}
+    
+@router.post("/reset")
+async def reset_database():
+    try:
+        url = os.environ.get("QDRANT_URL")
+        key = os.environ.get("QDRANT_KEY")
+        
+        # Clean URL
+        base_url = url.replace(":6333", "")
+        collection_url = f"{base_url}/collections/pdf_chat"
+        
+        headers = {
+            "api-key": key,
+            "Content-Type": "application/json"
+        }
+
+        async with httpx.AsyncClient() as client:
+            # Step 1: Delete the entire collection
+            print("Deleting collection...")
+            await client.delete(collection_url, headers=headers)
+            
+            # Step 2: Recreate with size 3072
+            print("Recreating collection with size 3072...")
+            create_payload = {
+                "vectors": {
+                    "size": 3072, # <--- UPDATED TO 3072
+                    "distance": "Cosine"
+                }
+            }
+            create_res = await client.put(collection_url, json=create_payload, headers=headers)
+            
+            if create_res.status_code != 200:
+                raise Exception(f"Failed to recreate: {create_res.text}")
+
+        return {
+            "status": "success", 
+            "message": "Database reset. Collection 'pdf_chat' recreated with 3072 dimensions."
+        }
+
+    except Exception as e:
+        print(f"Reset Error: {e}")
+        return {"status": "error", "detail": str(e)}
