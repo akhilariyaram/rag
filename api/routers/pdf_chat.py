@@ -60,7 +60,6 @@ async def upload_pdf(
     api_key: str = Form(...)
 ):
     try:
-        await wipe_and_recreate_collection()
         client = genai.Client(api_key=api_key)
 
         # 1. Extract Text
@@ -188,29 +187,3 @@ async def cleanup(session_id: str = Form(...)):
         return {"status": "cleaned"}
     except Exception as e:
         return {"status": "error", "detail": str(e)}
-async def wipe_and_recreate_collection():
-    print("🧹 Starting Database Wipe...")
-    url = os.environ.get("QDRANT_URL")
-    key = os.environ.get("QDRANT_KEY")
-    base_url = url.replace(":6333", "")
-    collection_url = f"{base_url}/collections/pdf_chat"
-    
-    headers = {"api-key": key, "Content-Type": "application/json"}
-
-    async with httpx.AsyncClient() as client:
-        # 1. DELETE existing collection
-        await client.delete(collection_url, headers=headers)
-        
-        # 2. CREATE new collection
-        # CRITICAL FIX: Gemini models use 768 dimensions by default. 
-        # Setting this to 3072 would cause a crash.
-        payload = {
-            "vectors": {
-                "size": 3072,  
-                "distance": "Cosine"
-            }
-        }
-        res = await client.put(collection_url, json=payload, headers=headers)
-        if res.status_code != 200:
-            print(f"⚠️ Recreate Warning: {res.text}")
-    print("✨ Database Cleaned & Recreated.")
