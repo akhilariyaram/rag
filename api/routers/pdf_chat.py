@@ -3,10 +3,11 @@ from pydantic import BaseModel
 from google import genai
 from google.genai import types
 from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
+from qdrant_client.models import PointStruct
 import io
 import uuid
 import os
+import httpx
 from dotenv import load_dotenv
 from pypdf import PdfReader
 
@@ -15,20 +16,53 @@ load_dotenv()
 router = APIRouter()
 
 # 1. Initialize Clients
+# We keep the client for upsert (upload) since that seems to work, 
+# but we will use raw HTTP for search to avoid the crash.
 qdrant_client = QdrantClient(
     url=os.environ.get("QDRANT_URL"),
     api_key=os.environ.get("QDRANT_KEY")
 )
 
-# --- DEBUG BLOCK (This will save us) ---
-# This prints all available commands to your Vercel Logs
-print("🔍 DEBUGGING QDRANT OBJECT:")
-print(f"Type: {type(qdrant_client)}")
-try:
-    print(f"DIR: {dir(qdrant_client)}")
-except:
-    print("Could not print dir")
-# ---------------------------------------
+# Helper function for Direct HTTP Search
+async def raw_qdrant_search(query_vector, session_id):
+    url = os.environ.get("QDRANT_URL")
+    key = os.environ.get("QDRANT_KEY")
+    
+    # Clean URL if needed
+    if url.endswith(":6333"):
+        base_url = url.replace(":6333", "")
+    else:
+        base_url = url
+        
+    # Endpoint for searching points
+    search_url = f"{base_url}/collections/pdf_chat/points/search"
+    
+    payload = {
+        "vector": query_vector,
+        "limit": 4,
+        "filter": {
+            "must": [
+                {
+                    "key": "session_id",
+                    "match": {
+                        "value": session_id
+                    }
+                }
+            ]
+        },
+        "with_payload": True
+    }
+    
+    headers = {
+        "api-key": key,
+        "Content-Type": "application/json"
+    }
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(search_url, json=payload, headers=headers)
+        if response.status_code != 200:
+            raise Exception(f"Qdrant Search Failed: {response.text}")
+        return response.json()["result"]
 
 class ChatRequest(BaseModel):
     question: str
@@ -89,6 +123,7 @@ async def chat(request: ChatRequest):
     try:
         client = genai.Client(api_key=request.api_key)
 
+        # Embed Question
         response = client.models.embed_content(
             model="models/gemini-embedding-001",
             contents=request.question,
@@ -96,39 +131,15 @@ async def chat(request: ChatRequest):
         )
         query_vector = response.embeddings[0].values
         
-        search_filter = Filter(
-            must=[FieldCondition(key="session_id", match=MatchValue(value=request.session_id))]
-        )
-
-        # --- EXTREME SAFETY BLOCK ---
-        # We check if the method exists before calling it
-        if hasattr(qdrant_client, 'search'):
-            print("✅ Using .search()")
-            search_result = qdrant_client.search(
-                collection_name="pdf_chat",
-                query_vector=query_vector,
-                limit=4,
-                query_filter=search_filter
-            )
-        elif hasattr(qdrant_client, 'search_points'):
-            print("⚠️ Using .search_points()")
-            search_result = qdrant_client.search_points(
-                collection_name="pdf_chat",
-                vector=query_vector,
-                limit=4,
-                filter=search_filter
-            )
-        else:
-            # If both fail, we manually crash and print why
-            print("❌ FATAL: Neither .search nor .search_points found!")
-            print(f"Available methods: {dir(qdrant_client)}")
-            raise HTTPException(status_code=500, detail="Qdrant Client Version Mismatch")
-        # ----------------------------
+        # --- NEW: RAW HTTP SEARCH (Bypasses the broken library) ---
+        search_results = await raw_qdrant_search(query_vector, request.session_id)
+        # ----------------------------------------------------------
         
-        if not search_result:
+        if not search_results:
             return {"answer": "I couldn't find any relevant info in the PDF."}
 
-        context_text = "\n\n".join([hit.payload['text'] for hit in search_result])
+        # Parse raw JSON response
+        context_text = "\n\n".join([hit['payload']['text'] for hit in search_results])
         
         prompt = f"""You are a helpful assistant. Answer based on the context provided.
         
@@ -153,6 +164,9 @@ Answer:"""
 @router.post("/cleanup")
 async def cleanup(session_id: str = Form(...)):
     try:
+        # We can leave this one as is, or remove it if it crashes.
+        # Cleanup is less critical than chat.
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
         qdrant_client.delete(
             collection_name="pdf_chat",
             points_selector=Filter(
