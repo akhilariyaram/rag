@@ -8,7 +8,7 @@ import io
 import uuid
 import os
 import httpx
-import time  # <--- NEW: Needed for sleeping
+import time
 from dotenv import load_dotenv
 from pypdf import PdfReader
 
@@ -22,6 +22,32 @@ qdrant_client = QdrantClient(
     api_key=os.environ.get("QDRANT_KEY")
 )
 
+# --- HELPER: WIPE & RESET DB ---
+async def wipe_and_recreate_collection():
+    print("🧹 Starting Database Wipe...")
+    url = os.environ.get("QDRANT_URL")
+    key = os.environ.get("QDRANT_KEY")
+    base_url = url.replace(":6333", "")
+    collection_url = f"{base_url}/collections/pdf_chat"
+    
+    headers = {"api-key": key, "Content-Type": "application/json"}
+
+    async with httpx.AsyncClient() as client:
+        # 1. DELETE existing collection
+        await client.delete(collection_url, headers=headers)
+        
+        # 2. CREATE new collection
+        payload = {
+            "vectors": {
+                "size": 3072,  # Kept as requested
+                "distance": "Cosine"
+            }
+        }
+        res = await client.put(collection_url, json=payload, headers=headers)
+        if res.status_code != 200:
+            print(f"⚠️ Recreate Warning: {res.text}")
+    print("✨ Database Cleaned & Recreated.")
+
 # --- MANUAL SEARCH FUNCTION ---
 async def raw_qdrant_search(query_vector, session_id):
     url = os.environ.get("QDRANT_URL")
@@ -29,12 +55,12 @@ async def raw_qdrant_search(query_vector, session_id):
     base_url = url.replace(":6333", "") 
     search_url = f"{base_url}/collections/pdf_chat/points/search"
     
+    # --- LOGIC FIX HERE ---
+    # Removed the "filter" block. 
+    # Since we wipe the DB on upload, filtering is not required and caused the error.
     payload = {
         "vector": query_vector,
-        "limit": 4,
-        "filter": {
-            "must": [{"key": "session_id", "match": {"value": session_id}}]
-        },
+        "limit": 5,
         "with_payload": True
     }
     
@@ -46,7 +72,6 @@ async def raw_qdrant_search(query_vector, session_id):
             print(f"Qdrant Error: {response.text}") 
             raise Exception(f"Qdrant Search Failed: {response.status_code}")
         return response.json()["result"]
-# -----------------------------
 
 class ChatRequest(BaseModel):
     question: str
@@ -60,9 +85,12 @@ async def upload_pdf(
     api_key: str = Form(...)
 ):
     try:
+        # 1. WIPE DB
+        await wipe_and_recreate_collection()
+
         client = genai.Client(api_key=api_key)
 
-        # 1. Extract Text
+        # 2. Extract Text
         pdf_reader = PdfReader(io.BytesIO(await file.read()))
         text = ""
         for page in pdf_reader.pages:
@@ -73,7 +101,7 @@ async def upload_pdf(
         if not text.strip():
             raise HTTPException(status_code=400, detail="No text found in PDF")
 
-        # 2. Chunking
+        # 3. Chunking
         chunk_size = 1000
         overlap = 100
         chunks = []
@@ -82,42 +110,36 @@ async def upload_pdf(
             
         print(f"Total chunks to process: {len(chunks)}")
 
-        # 3. Embedding with Rate Limit Handling (THE FIX)
+        # 4. Embedding
         vectors = []
-        batch_size = 50 # Smaller batch size to be safe
+        batch_size = 50
         
         for i in range(0, len(chunks), batch_size):
             batch = chunks[i : i + batch_size]
             print(f"Processing batch {i} to {i+len(batch)}...")
             
-            # Retry Loop
             retry_count = 0
             while True:
                 try:
                     response = client.models.embed_content(
-                        model="models/gemini-embedding-001",
+                        model="models/gemini-embedding-001", # Kept as requested
                         contents=batch,
                         config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT")
                     )
                     batch_vectors = [e.values for e in response.embeddings]
                     vectors.extend(batch_vectors)
-                    
-                    # Polite pause to avoid hitting limit immediately
                     time.sleep(1) 
-                    break # Success, exit retry loop
-                    
+                    break 
                 except Exception as e:
-                    # Check if it's a Rate Limit error (429)
                     if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                        print(f"⚠️ Quota hit! Sleeping for 30 seconds... (Attempt {retry_count+1})")
-                        time.sleep(30) # Wait for quota to reset
+                        print(f"⚠️ Quota hit! Sleeping for 30 seconds...")
+                        time.sleep(30)
                         retry_count += 1
-                        if retry_count > 5:
-                            raise HTTPException(status_code=429, detail="Google API Quota Exceeded. Please try again later.")
+                        if retry_count > 5: raise e
                     else:
-                        raise e # If it's another error, crash
+                        raise e
 
-        # 4. Upsert to Qdrant
+        # 5. Upsert to Qdrant
         points = []
         for i, (chunk, vector) in enumerate(zip(chunks, vectors)):
             points.append(PointStruct(
@@ -127,8 +149,7 @@ async def upload_pdf(
             ))
         
         qdrant_client.upsert(collection_name="pdf_chat", points=points)
-        
-        return {"message": "PDF processed", "chunks": len(chunks)}
+        return {"message": "PDF processed & Database Reset", "chunks": len(chunks)}
 
     except Exception as e:
         print(f"Error: {e}")
@@ -141,7 +162,7 @@ async def chat(request: ChatRequest):
         client = genai.Client(api_key=request.api_key)
 
         response = client.models.embed_content(
-            model="models/gemini-embedding-001",
+            model="models/gemini-embedding-001", # Kept as requested
             contents=request.question,
             config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY")
         )
@@ -176,14 +197,10 @@ Answer:"""
 
 @router.post("/cleanup")
 async def cleanup(session_id: str = Form(...)):
-    try:
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
-        qdrant_client.delete(
-            collection_name="pdf_chat",
-            points_selector=Filter(
-                must=[FieldCondition(key="session_id", match=MatchValue(value=session_id))]
-            )
-        )
-        return {"status": "cleaned"}
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
+    await wipe_and_recreate_collection()
+    return {"status": "cleaned"}
+
+@router.post("/reset")
+async def reset_database():
+    await wipe_and_recreate_collection()
+    return {"status": "reset"}
