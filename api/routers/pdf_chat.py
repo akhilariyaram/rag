@@ -7,7 +7,7 @@ from qdrant_client.models import PointStruct
 import io
 import uuid
 import os
-import httpx # <--- MAKE SURE THIS IS HERE
+import httpx
 from dotenv import load_dotenv
 from pypdf import PdfReader
 
@@ -15,56 +15,37 @@ load_dotenv()
 
 router = APIRouter()
 
-# Initialize Qdrant Client (Only for Uploads/Upsert)
+# Initialize Qdrant Client
 qdrant_client = QdrantClient(
     url=os.environ.get("QDRANT_URL"),
     api_key=os.environ.get("QDRANT_KEY")
 )
 
-# --- MANUAL SEARCH FUNCTION (Bypasses the library "search" command) ---
+# --- MANUAL SEARCH FUNCTION ---
 async def raw_qdrant_search(query_vector, session_id):
     url = os.environ.get("QDRANT_URL")
     key = os.environ.get("QDRANT_KEY")
-    
-    # 1. Clean the URL (Remove :6333 if present, as HTTP API uses standard ports often)
-    # But Qdrant Cloud usually accepts the raw URL. 
-    # Let's ensure we target the REST endpoint correctly.
     base_url = url.replace(":6333", "") 
-    
-    # 2. Define the Search Endpoint
     search_url = f"{base_url}/collections/pdf_chat/points/search"
     
-    # 3. Build the Payload Manually
     payload = {
         "vector": query_vector,
         "limit": 4,
         "filter": {
-            "must": [
-                {
-                    "key": "session_id",
-                    "match": {
-                        "value": session_id
-                    }
-                }
-            ]
+            "must": [{"key": "session_id", "match": {"value": session_id}}]
         },
         "with_payload": True
     }
     
-    headers = {
-        "api-key": key,
-        "Content-Type": "application/json"
-    }
+    headers = {"api-key": key, "Content-Type": "application/json"}
 
-    # 4. Send the Request
     async with httpx.AsyncClient() as client:
         response = await client.post(search_url, json=payload, headers=headers)
         if response.status_code != 200:
-            # If this fails, we will see the REAL error from the server
             print(f"Qdrant Error: {response.text}") 
             raise Exception(f"Qdrant Search Failed: {response.status_code}")
         return response.json()["result"]
-# ---------------------------------------------------------------------
+# -----------------------------
 
 class ChatRequest(BaseModel):
     question: str
@@ -80,6 +61,7 @@ async def upload_pdf(
     try:
         client = genai.Client(api_key=api_key)
 
+        # 1. Extract Text
         pdf_reader = PdfReader(io.BytesIO(await file.read()))
         text = ""
         for page in pdf_reader.pages:
@@ -90,20 +72,33 @@ async def upload_pdf(
         if not text.strip():
             raise HTTPException(status_code=400, detail="No text found in PDF")
 
+        # 2. Chunking
         chunk_size = 1000
         overlap = 100
         chunks = []
         for i in range(0, len(text), chunk_size - overlap):
             chunks.append(text[i:i+chunk_size])
             
-        response = client.models.embed_content(
-            model="models/gemini-embedding-001",
-            contents=chunks,
-            config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT")
-        )
-        
-        vectors = [e.values for e in response.embeddings]
+        print(f"Total chunks created: {len(chunks)}")
 
+        # 3. Embedding in Batches of 100 (THE FIX)
+        vectors = []
+        batch_size = 100  # Google API limit
+        
+        for i in range(0, len(chunks), batch_size):
+            batch = chunks[i : i + batch_size]
+            print(f"Embedding batch {i} to {i+len(batch)}...")
+            
+            response = client.models.embed_content(
+                model="models/gemini-embedding-001",
+                contents=batch,
+                config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT")
+            )
+            # Collect vectors from this batch
+            batch_vectors = [e.values for e in response.embeddings]
+            vectors.extend(batch_vectors)
+
+        # 4. Upsert to Qdrant
         points = []
         for i, (chunk, vector) in enumerate(zip(chunks, vectors)):
             points.append(PointStruct(
@@ -112,7 +107,9 @@ async def upload_pdf(
                 payload={"session_id": session_id, "text": chunk}
             ))
         
+        # We also batch the upload to Qdrant to be safe
         qdrant_client.upsert(collection_name="pdf_chat", points=points)
+        
         return {"message": "PDF processed", "chunks": len(chunks)}
 
     except Exception as e:
@@ -125,7 +122,6 @@ async def chat(request: ChatRequest):
     try:
         client = genai.Client(api_key=request.api_key)
 
-        # Embed Question
         response = client.models.embed_content(
             model="models/gemini-embedding-001",
             contents=request.question,
@@ -133,11 +129,7 @@ async def chat(request: ChatRequest):
         )
         query_vector = response.embeddings[0].values
         
-        # --- EXECUTE MANUAL SEARCH ---
-        # If the code reaches here, it CANNOT throw an "AttributeError" 
-        # because we aren't calling .search() on the object anymore.
         search_results = await raw_qdrant_search(query_vector, request.session_id)
-        # -----------------------------
         
         if not search_results:
             return {"answer": "I couldn't find any relevant info in the PDF."}
@@ -166,7 +158,6 @@ Answer:"""
 
 @router.post("/cleanup")
 async def cleanup(session_id: str = Form(...)):
-    # Simple cleanup can stay as is, or we can wrap it in try/except pass
     try:
         from qdrant_client.models import Filter, FieldCondition, MatchValue
         qdrant_client.delete(
@@ -177,5 +168,4 @@ async def cleanup(session_id: str = Form(...)):
         )
         return {"status": "cleaned"}
     except Exception as e:
-        print(f"Cleanup Error: {e}")
         return {"status": "error", "detail": str(e)}
