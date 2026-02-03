@@ -8,6 +8,7 @@ import io
 import uuid
 import os
 import httpx
+import time  # <--- NEW: Needed for sleeping
 from dotenv import load_dotenv
 from pypdf import PdfReader
 
@@ -79,24 +80,42 @@ async def upload_pdf(
         for i in range(0, len(text), chunk_size - overlap):
             chunks.append(text[i:i+chunk_size])
             
-        print(f"Total chunks created: {len(chunks)}")
+        print(f"Total chunks to process: {len(chunks)}")
 
-        # 3. Embedding in Batches of 100 (THE FIX)
+        # 3. Embedding with Rate Limit Handling (THE FIX)
         vectors = []
-        batch_size = 100  # Google API limit
+        batch_size = 50 # Smaller batch size to be safe
         
         for i in range(0, len(chunks), batch_size):
             batch = chunks[i : i + batch_size]
-            print(f"Embedding batch {i} to {i+len(batch)}...")
+            print(f"Processing batch {i} to {i+len(batch)}...")
             
-            response = client.models.embed_content(
-                model="models/gemini-embedding-001",
-                contents=batch,
-                config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT")
-            )
-            # Collect vectors from this batch
-            batch_vectors = [e.values for e in response.embeddings]
-            vectors.extend(batch_vectors)
+            # Retry Loop
+            retry_count = 0
+            while True:
+                try:
+                    response = client.models.embed_content(
+                        model="models/gemini-embedding-001",
+                        contents=batch,
+                        config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT")
+                    )
+                    batch_vectors = [e.values for e in response.embeddings]
+                    vectors.extend(batch_vectors)
+                    
+                    # Polite pause to avoid hitting limit immediately
+                    time.sleep(1) 
+                    break # Success, exit retry loop
+                    
+                except Exception as e:
+                    # Check if it's a Rate Limit error (429)
+                    if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                        print(f"⚠️ Quota hit! Sleeping for 30 seconds... (Attempt {retry_count+1})")
+                        time.sleep(30) # Wait for quota to reset
+                        retry_count += 1
+                        if retry_count > 5:
+                            raise HTTPException(status_code=429, detail="Google API Quota Exceeded. Please try again later.")
+                    else:
+                        raise e # If it's another error, crash
 
         # 4. Upsert to Qdrant
         points = []
@@ -107,7 +126,6 @@ async def upload_pdf(
                 payload={"session_id": session_id, "text": chunk}
             ))
         
-        # We also batch the upload to Qdrant to be safe
         qdrant_client.upsert(collection_name="pdf_chat", points=points)
         
         return {"message": "PDF processed", "chunks": len(chunks)}
