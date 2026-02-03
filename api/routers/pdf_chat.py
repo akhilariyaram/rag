@@ -20,6 +20,16 @@ qdrant_client = QdrantClient(
     api_key=os.environ.get("QDRANT_KEY")
 )
 
+# --- DEBUG BLOCK (This will save us) ---
+# This prints all available commands to your Vercel Logs
+print("🔍 DEBUGGING QDRANT OBJECT:")
+print(f"Type: {type(qdrant_client)}")
+try:
+    print(f"DIR: {dir(qdrant_client)}")
+except:
+    print("Could not print dir")
+# ---------------------------------------
+
 class ChatRequest(BaseModel):
     question: str
     session_id: str
@@ -32,10 +42,8 @@ async def upload_pdf(
     api_key: str = Form(...)
 ):
     try:
-        # Client setup
         client = genai.Client(api_key=api_key)
 
-        # PDF Extraction
         pdf_reader = PdfReader(io.BytesIO(await file.read()))
         text = ""
         for page in pdf_reader.pages:
@@ -46,14 +54,12 @@ async def upload_pdf(
         if not text.strip():
             raise HTTPException(status_code=400, detail="No text found in PDF")
 
-        # Chunking
         chunk_size = 1000
         overlap = 100
         chunks = []
         for i in range(0, len(text), chunk_size - overlap):
             chunks.append(text[i:i+chunk_size])
             
-        # Embedding (Specific Model)
         response = client.models.embed_content(
             model="models/gemini-embedding-001",
             contents=chunks,
@@ -62,7 +68,6 @@ async def upload_pdf(
         
         vectors = [e.values for e in response.embeddings]
 
-        # Upsert
         points = []
         for i, (chunk, vector) in enumerate(zip(chunks, vectors)):
             points.append(PointStruct(
@@ -84,7 +89,6 @@ async def chat(request: ChatRequest):
     try:
         client = genai.Client(api_key=request.api_key)
 
-        # Embed Question
         response = client.models.embed_content(
             model="models/gemini-embedding-001",
             contents=request.question,
@@ -92,29 +96,34 @@ async def chat(request: ChatRequest):
         )
         query_vector = response.embeddings[0].values
         
-        # --- SMART SEARCH (Works on ALL versions) ---
         search_filter = Filter(
             must=[FieldCondition(key="session_id", match=MatchValue(value=request.session_id))]
         )
 
-        try:
-            # TRY 1: Modern Method (v1.7+)
+        # --- EXTREME SAFETY BLOCK ---
+        # We check if the method exists before calling it
+        if hasattr(qdrant_client, 'search'):
+            print("✅ Using .search()")
             search_result = qdrant_client.search(
                 collection_name="pdf_chat",
                 query_vector=query_vector,
                 limit=4,
                 query_filter=search_filter
             )
-        except AttributeError:
-            print("⚠️ Warning: .search() failed. Using legacy .search_points()")
-            # TRY 2: Legacy Method (v1.6 and older)
+        elif hasattr(qdrant_client, 'search_points'):
+            print("⚠️ Using .search_points()")
             search_result = qdrant_client.search_points(
                 collection_name="pdf_chat",
                 vector=query_vector,
                 limit=4,
                 filter=search_filter
             )
-        # --------------------------------------------
+        else:
+            # If both fail, we manually crash and print why
+            print("❌ FATAL: Neither .search nor .search_points found!")
+            print(f"Available methods: {dir(qdrant_client)}")
+            raise HTTPException(status_code=500, detail="Qdrant Client Version Mismatch")
+        # ----------------------------
         
         if not search_result:
             return {"answer": "I couldn't find any relevant info in the PDF."}
@@ -130,7 +139,6 @@ Question: {request.question}
 
 Answer:"""
         
-        # Generate Answer (Specific Model)
         chat_response = client.models.generate_content(
             model="models/gemma-3-4b-it",
             contents=prompt
