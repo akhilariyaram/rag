@@ -1,19 +1,20 @@
-# api/routers/pdf_chat.py
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
 import io
 import uuid
 import os
+from dotenv import load_dotenv
 from pypdf import PdfReader
-from dotenv import load_dotenv  # <--- Add this
+
 load_dotenv()
-# 1. Initialize Router instead of FastAPI
+
 router = APIRouter()
 
-# 2. Shared Config (Qdrant/Gemini)
+# 1. Initialize Qdrant (Same as before)
 qdrant_client = QdrantClient(
     url=os.environ.get("QDRANT_URL"),
     api_key=os.environ.get("QDRANT_KEY")
@@ -24,18 +25,17 @@ class ChatRequest(BaseModel):
     session_id: str
     api_key: str
 
-# 3. Routes (Notice we use @router, not @app)
 @router.post("/upload")
 async def upload_pdf(
     file: UploadFile = File(...),
     session_id: str = Form(...),
     api_key: str = Form(...)
 ):
-    # ... [PASTE YOUR EXISTING UPLOAD CODE HERE] ...
-    # (Copy the exact logic from your current upload_pdf function)
-    # Just ensure indentation is correct
     try:
-        genai.configure(api_key=api_key)
+        # --- NEW SDK SETUP ---
+        client = genai.Client(api_key=api_key)
+
+        # 1. Extract Text
         pdf_reader = PdfReader(io.BytesIO(await file.read()))
         text = ""
         for page in pdf_reader.pages:
@@ -44,23 +44,31 @@ async def upload_pdf(
                 text += page_text + "\n"
         
         if not text.strip():
-            raise HTTPException(status_code=400, detail="No text found")
+            raise HTTPException(status_code=400, detail="No text found in PDF")
 
+        # 2. Chunking
         chunk_size = 1000
         overlap = 100
         chunks = []
         for i in range(0, len(text), chunk_size - overlap):
             chunks.append(text[i:i+chunk_size])
             
-        result = genai.embed_content(
+        # 3. Generate Embeddings (Your Specific Model)
+        # We process chunks in batch for efficiency
+        response = client.models.embed_content(
             model="models/gemini-embedding-001",
-            content=chunks,
-            task_type="retrieval_document"
+            contents=chunks,
+            config=types.EmbedContentConfig(
+                task_type="RETRIEVAL_DOCUMENT"
+            )
         )
-        embeddings = result['embedding']
+        
+        # New SDK returns a list of embedding objects. We extract .values from each.
+        vectors = [e.values for e in response.embeddings]
 
+        # 4. Upsert to Qdrant
         points = []
-        for i, (chunk, vector) in enumerate(zip(chunks, embeddings)):
+        for i, (chunk, vector) in enumerate(zip(chunks, vectors)):
             points.append(PointStruct(
                 id=str(uuid.uuid4()),
                 vector=vector,
@@ -68,7 +76,7 @@ async def upload_pdf(
             ))
         
         qdrant_client.upsert(collection_name="pdf_chat", points=points)
-        return {"message": "PDF processed"}
+        return {"message": "PDF processed", "chunks": len(chunks)}
 
     except Exception as e:
         print(f"Error: {e}")
@@ -77,16 +85,21 @@ async def upload_pdf(
 
 @router.post("/chat")
 async def chat(request: ChatRequest):
-    # ... [PASTE YOUR EXISTING CHAT CODE HERE] ...
     try:
-        genai.configure(api_key=request.api_key)
-        embedding_res = genai.embed_content(
+        # --- NEW SDK SETUP ---
+        client = genai.Client(api_key=request.api_key)
+
+        # 1. Embed Question (Your Specific Model)
+        response = client.models.embed_content(
             model="models/gemini-embedding-001",
-            content=request.question,
-            task_type="retrieval_query"
+            contents=request.question,
+            config=types.EmbedContentConfig(
+                task_type="RETRIEVAL_QUERY"
+            )
         )
-        query_vector = embedding_res['embedding']
+        query_vector = response.embeddings[0].values
         
+        # 2. Search Qdrant
         search_result = qdrant_client.search(
             collection_name="pdf_chat",
             query_vector=query_vector,
@@ -102,14 +115,26 @@ async def chat(request: ChatRequest):
         )
         
         if not search_result:
-            return {"answer": "No info found."}
+            return {"answer": "I couldn't find any relevant info in the PDF."}
 
+        # 3. Generate Answer (Your Specific Model)
         context_text = "\n\n".join([hit.payload['text'] for hit in search_result])
-        prompt = f"Context:\n{context_text}\n\nQuestion: {request.question}\nAnswer:"
         
-        model = genai.GenerativeModel('models/gemma-3-4b-it')
-        response = model.generate_content(prompt)
-        return {"answer": response.text}
+        prompt = f"""You are a helpful assistant. Answer based on the context provided.
+        
+Context:
+{context_text}
+
+Question: {request.question}
+
+Answer:"""
+        
+        chat_response = client.models.generate_content(
+            model="models/gemma-3-4b-it",
+            contents=prompt
+        )
+        
+        return {"answer": chat_response.text}
 
     except Exception as e:
         print(f"Error: {e}")
@@ -117,7 +142,6 @@ async def chat(request: ChatRequest):
 
 @router.post("/cleanup")
 async def cleanup(session_id: str = Form(...)):
-    # ... [PASTE YOUR EXISTING CLEANUP CODE HERE] ...
     try:
         qdrant_client.delete(
             collection_name="pdf_chat",
